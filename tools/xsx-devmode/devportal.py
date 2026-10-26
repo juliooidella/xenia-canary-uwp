@@ -136,6 +136,8 @@ class DevicePortal:
 
         The portal answers the state query with 204 (empty body) while the
         deployment runs and with 200 + the result of the last deployment after it.
+        With no deployment registered it answers 404 ("No installation action
+        was found"), which is treated as not started yet.
         """
         files = [(f.name, f.name, f.read_bytes()) for f in (package, *extras)]
         body, ctype = self._multipart(files)
@@ -143,7 +145,12 @@ class DevicePortal:
                       data=body, headers={"Content-Type": ctype}, timeout=1800)
         deadline = time.monotonic() + timeout
         while True:
-            raw = self._request("GET", "/api/app/packagemanager/state")
+            try:
+                raw = self._request("GET", "/api/app/packagemanager/state")
+            except RuntimeError as e:
+                if "HTTP 404" not in str(e):
+                    raise
+                raw = b""
             if raw.strip():
                 result = json.loads(raw.decode("utf-8"))
                 if not result.get("Success", True):

@@ -140,13 +140,18 @@ class DevPortalTests(unittest.TestCase):
             def _request(self, method, path, params=None, data=None, headers=None, timeout=60):
                 self.calls.append((method, path, params, data, headers))
                 if path == "/api/app/packagemanager/state":
-                    return self.states.pop(0)
+                    state = self.states.pop(0)
+                    if isinstance(state, Exception):
+                        raise state
+                    return state
                 return b""
 
         return FakePortal()
 
     def test_install_uploads_and_polls(self):
-        dp = self._fake_portal([b"", b"", b'{"Code": 0, "CodeText": "OK", "Success": true}'])
+        not_started = RuntimeError('GET /api/app/packagemanager/state -> HTTP 404: '
+                                   '{"Reason" : "No installation action was found"}')
+        dp = self._fake_portal([not_started, b"", b'{"Code": 0, "CodeText": "OK", "Success": true}'])
         with tempfile.TemporaryDirectory() as td:
             appx = Path(td) / "Xenia-Netplay-0.6.0.3.appx"
             cert = Path(td) / "Xenia-Netplay-0.6.0.3-CI.cer"
