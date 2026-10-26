@@ -62,6 +62,15 @@ To build your own package with the same signing step, create a certificate
 whose subject equals the manifest `Publisher`, then configure with
 `cmake --preset uwp -DXENIA_UWP_SIGN_SHA1=<thumbprint>`.
 
+Measured on the first successful run (40366497813, 2026-10-26, commit
+a5d912b): the `windows-2022` image had Visual Studio Enterprise 2022 17.14
+with `Microsoft.VisualStudio.Workload.Universal` but without
+`Microsoft.VisualStudio.ComponentGroup.UWP.VC`, which the job installed in
+about 6 minutes. Configure took 2 minutes, the build 25 minutes, and the whole
+job 35 minutes. It produced a 99 MB package and used about 10 GB on `D:`.
+The packaged manifest declares `MaxVersionTested="10.0.26100.0"` (the build
+SDK replaces the source value) and `Microsoft.VCLibs.140.00 >= 14.0.33519.0`.
+
 Installing over an existing package requires a higher `Identity Version` with
 the same `Name` and `Publisher`. The package family name depends only on these
 two values, not on the certificate.
