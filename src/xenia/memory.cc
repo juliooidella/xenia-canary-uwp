@@ -23,6 +23,10 @@
 
 #include "xenia/cpu/mmio_handler.h"
 
+#if XE_PLATFORM_WIN32
+#include "xenia/base/platform_win.h"
+#endif
+
 // TODO(benvanik): move xbox.h out
 #include "xenia/xbox.h"
 
@@ -45,6 +49,16 @@ DEFINE_bool(protect_on_release, false,
             "Protect released memory to prevent accesses.", "Memory");
 DEFINE_bool(scribble_heap, false,
             "Scribble specific or random value into all allocated heap memory.",
+            "Memory");
+DEFINE_bool(compact_guest_mapping, false,
+            "Back the guest address space with a 2.75 GB file mapping instead "
+            "of 4.5 GB. The file ranges behind 0x90000000-0xFFFFFFFF are never "
+            "mapped, so the physical range moves down to offset 0x90000000. "
+            "The guest layout does not change.",
+            "Memory");
+DEFINE_bool(precommit_physical_memory, true,
+            "Commit the whole 512 MB guest physical range at startup so the GPU "
+            "can access any physical address.",
             "Memory");
 DEFINE_int32(scribble_heap_value, 0,
              "Value used to fill all allocated heap memory. 0 - Random value. "
@@ -115,6 +129,15 @@ static inline bool ShouldSkipHostCommit(const BaseHeap& heap) {
   return false;
 }
 
+// ERROR_COMMITMENT_LIMIT (1455) means the system commit charge is exhausted.
+static std::string HostErrorSuffix() {
+#if XE_PLATFORM_WIN32
+  return fmt::format(" (error {})", GetLastError());
+#else
+  return {};
+#endif
+}
+
 void RandomizeMemory(void* range_start, uint32_t size) {
   if (!cvars::scribble_heap) {
     return;
@@ -174,20 +197,39 @@ Memory::~Memory() {
   physical_membase_ = nullptr;
 }
 
+void Memory::LogHostCommit(std::string_view step) {
+#if XE_PLATFORM_WIN32
+  // The system commit charge; on Xbox it also counts what the app memory
+  // usage counter misses.
+  MEMORYSTATUSEX status = {};
+  status.dwLength = sizeof(status);
+  if (GlobalMemoryStatusEx(&status)) {
+    XELOGI("Host commit {}: {} MiB of {} MiB", step,
+           (status.ullTotalPageFile - status.ullAvailPageFile) >> 20,
+           status.ullTotalPageFile >> 20);
+  }
+#endif
+}
+
 bool Memory::Initialize() {
   file_name_ = fmt::format("xenia_memory_{}", Clock::QueryHostTickCount());
+  compact_mapping_ = cvars::compact_guest_mapping;
+  LogHostCommit("before guest mapping");
 
   // Create main page file-backed mapping. This is all reserved but
   // uncommitted (so it shouldn't expand page file).
   mapping_ = xe::memory::CreateFileMappingHandle(
       file_name_,
-      // entire 4gb space + 512mb physical:
-      0x11FFFFFFF, xe::memory::PageAccess::kReadWrite, false);
+      // entire 4gb space + 512mb physical, or only the used ranges:
+      compact_mapping_ ? kCompactMappingSize : 0x11FFFFFFF,
+      xe::memory::PageAccess::kReadWrite, false);
   if (mapping_ == xe::memory::kFileMappingHandleInvalid) {
     XELOGE("Unable to reserve the 4gb guest address space.");
     assert_always();
     return false;
   }
+  LogHostCommit(compact_mapping_ ? "after compact guest mapping"
+                                 : "after guest mapping");
 
   // Attempt to create our views. This may fail at the first address
   // we pick, so try a few times.
@@ -206,6 +248,7 @@ bool Memory::Initialize() {
   }
   virtual_membase_ = mapping_base_;
   physical_membase_ = mapping_base_ + 0x100000000ull;
+  LogHostCommit("after guest views");
 
   // Prepare virtual heaps.
   heaps_.v00000000.Initialize(this, virtual_membase_, HeapType::kGuestVirtual,
@@ -255,11 +298,15 @@ bool Memory::Initialize() {
   // without any restriction. This however needs some form of validation.
   // That's why we're commiting whole physical memory range and deal with
   // allocations issues on custom page protection level.
-  for (size_t i = 1; i <= 16; i++) {
-    xe::memory::AllocFixed(heaps_.physical.TranslateRelative(i << 24),
-                           heaps_.physical.page_size() * 0x10000,
-                           xe::memory::AllocationType::kCommit,
-                           xe::memory::PageAccess::kReadWrite);
+  LogHostCommit("before physical precommit");
+  if (cvars::precommit_physical_memory) {
+    for (size_t i = 1; i <= 16; i++) {
+      xe::memory::AllocFixed(heaps_.physical.TranslateRelative(i << 24),
+                             heaps_.physical.page_size() * 0x10000,
+                             xe::memory::AllocationType::kCommit,
+                             xe::memory::PageAccess::kReadWrite);
+    }
+    LogHostCommit("after physical precommit");
   }
 
   // Add handlers for MMIO.
@@ -364,11 +411,15 @@ int Memory::MapViews(uint8_t* mapping_base) {
   // side if system allocation granularity is bigger than 4 KB.
   uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
   for (size_t n = 0; n < xe::countof(map_info); n++) {
+    uint64_t target_address = map_info[n].target_address;
+    if (compact_mapping_ && target_address >= kPhysicalMappingOffset) {
+      target_address -= kPhysicalMappingOffset - kCompactPhysicalMappingOffset;
+    }
     views_.all_views[n] = reinterpret_cast<uint8_t*>(xe::memory::MapFileView(
         mapping_, mapping_base + map_info[n].virtual_address_start,
         map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1,
         xe::memory::PageAccess::kReadWrite,
-        map_info[n].target_address & granularity_mask));
+        target_address & granularity_mask));
     if (!views_.all_views[n]) {
       // Failed, so bail and try again.
       UnmapViews();
@@ -1137,7 +1188,9 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size,
           TranslateRelative(start_page_number * page_size_),
           page_count * page_size_, alloc_type, ToPageAccess(protect));
       if (!result) {
-        XELOGE("BaseHeap::AllocFixed failed to alloc range from host");
+        XELOGE("BaseHeap::AllocFixed failed to alloc range from host{}",
+               HostErrorSuffix());
+        Memory::LogHostCommit("at failed allocation");
         return false;
       }
 
@@ -1325,7 +1378,9 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
           TranslateRelative(start_page_number << page_size_shift_),
           page_count << page_size_shift_, alloc_type, ToPageAccess(protect));
       if (!result) {
-        XELOGE("BaseHeap::Alloc failed to alloc range from host");
+        XELOGE("BaseHeap::Alloc failed to alloc range from host{}",
+               HostErrorSuffix());
+        Memory::LogHostCommit("at failed allocation");
         // Restore the free block since we failed.
         InsertFreeBlock(start_page_number, page_count);
         return false;

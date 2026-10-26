@@ -266,6 +266,7 @@ X_STATUS Emulator::Setup(
     return result;
   }
 
+  Memory::LogHostCommit("before Exports");
   XELOGI("{}: Initializing Exports...", __func__);
   // Shared export resolver used to attach and query for HLE exports.
   export_resolver_ = std::make_unique<xe::cpu::ExportResolver>();
@@ -293,6 +294,7 @@ X_STATUS Emulator::Setup(
     backend.reset(new xe::cpu::backend::NullBackend());
   }
 
+  Memory::LogHostCommit("before Processor");
   XELOGI("{}: Initializing Processor...", __func__);
   // Initialize the CPU.
   processor_ = std::make_unique<xe::cpu::Processor>(memory_.get(),
@@ -302,6 +304,7 @@ X_STATUS Emulator::Setup(
     return X_STATUS_UNSUCCESSFUL;
   }
 
+  Memory::LogHostCommit("before Audio");
   XELOGI("{}: Initializing Audio...", __func__);
   // Initialize the APU.
   if (audio_system_factory) {
@@ -312,6 +315,7 @@ X_STATUS Emulator::Setup(
     }
   }
 
+  Memory::LogHostCommit("before Graphics");
   XELOGI("{}: Initializing Graphics...", __func__);
   // Initialize the GPU.
   if (!graphics_system_) graphics_system_ = graphics_system_factory();
@@ -343,12 +347,14 @@ X_STATUS Emulator::Setup(
 
   }
 
+  Memory::LogHostCommit("before VFS");
   XELOGI("{}: Initializing VFS...", __func__);
   // Bring up the virtual filesystem used by the kernel.
   file_system_ = std::make_unique<xe::vfs::VirtualFileSystem>();
 
   patcher_ = std::make_unique<xe::patcher::Patcher>(storage_root_);
 
+  Memory::LogHostCommit("before Kernel");
   XELOGI("{}: Initializing Kernel...", __func__);
   // Shared kernel state.
   kernel_state_ = std::make_unique<xe::kernel::KernelState>(this);
@@ -366,6 +372,7 @@ X_STATUS Emulator::Setup(
   plugin_loader_ = std::make_unique<xe::patcher::PluginLoader>(
       kernel_state_.get(), storage_root() / "plugins");
 
+  Memory::LogHostCommit("before starting graphics_system");
   XELOGI("{}: Starting graphics_system...", __func__);
   // Setup the core components.
   result = reinitializing

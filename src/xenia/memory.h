@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -623,7 +624,17 @@ class Memory {
   void SetMMIOExceptionRecordingCallback(cpu::MmioAccessRecordCallback callback,
                                          void* context);
 
+  // Logs the host system commit charge with a label.
+  static void LogHostCommit(std::string_view step);
+
  private:
+  // File offset of the guest physical range in the full mapping, and in the
+  // compact one where it follows the 0x80000000 xex range.
+  static constexpr uint64_t kPhysicalMappingOffset = 0x100000000ull;
+  static constexpr uint64_t kCompactPhysicalMappingOffset = 0x90000000ull;
+  static constexpr size_t kCompactMappingSize =
+      kCompactPhysicalMappingOffset + 0x1FFFFFFF;
+
   int MapViews(uint8_t* mapping_base);
   void UnmapViews();
 
@@ -642,6 +653,7 @@ class Memory {
   uint8_t* virtual_membase_ = nullptr;
   uint8_t* physical_membase_ = nullptr;
 
+  bool compact_mapping_ = false;
   xe::memory::FileMappingHandle mapping_ =
       xe::memory::kFileMappingHandleInvalid;
   uint8_t* mapping_base_ = nullptr;
