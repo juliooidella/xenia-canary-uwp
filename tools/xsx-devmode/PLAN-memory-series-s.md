@@ -27,6 +27,15 @@ que reutiliza `src/xenia/memory.cc`, `src/xenia/base/memory_win.cc` e
   **sem efeito** no footprint do frontend (0,9 → 6,8 GB igual ao baseline); o Conviction caiu do mesmo
   jeito e, nessa execução, o console inteiro saiu da rede logo após o crash. Paliativos por config não
   resolvem.
+- 2026-10-26, build da CI 0.6.0.3 (`uwp-ci@a5d912b`, mesmo código do 0.6.0.2), Conviction pela `.iso`:
+  o jogo passa do boot, cria as threads de áudio (`Dare::*`) e lê `\Default\Sounds\Xbox360\English`,
+  depois morre com dois `CRASH DUMP` (PC `0x82E1A910` e `0x82E1A770`,
+  `Access Violation: read at 0x0000000100000004`). A base do mapeamento é a primeira tentativa,
+  `1ull << 32` (`memory.cc`, `Memory::Initialize`), então o endereço é o guest `0x00000004`: o jogo
+  leu um ponteiro nulo + 4, e a página zero é protegida (`protect_zero = true`). Com `log_level = 2`
+  **não** aparece `BaseHeap::Alloc failed` nem `AllocFixed failed`, então nenhuma alocação do host
+  falhou antes. Hipótese: falha de outra natureza (algum serviço do kernel/XAM devolvendo nulo) ou
+  uma alocação do guest que falha sem log. Não houve memwatch nessa execução.
 
 ## 2. Onde o custo nasce (código)
 
