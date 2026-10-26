@@ -33,3 +33,35 @@ certificate in Visual Studio when creating a package for installation.
 After installing, verify controller navigation, launching and returning from a
 game, profile dialogs, and a multiplayer session on the intended Xbox or UWP
 device. A host compilation alone does not validate those device interactions.
+
+## Continuous integration
+
+`.github/workflows/UWP_appx.yml` builds the package on `windows-2022` with the
+same commands as above. It runs on pushes to `xsx-devmode` and `uwp-ci` and on
+manual dispatch. The job:
+
+- checks with `vswhere` that the Visual Studio 2022 instance has
+  `Microsoft.VisualStudio.Workload.Universal` and
+  `Microsoft.VisualStudio.ComponentGroup.UWP.VC`, and installs missing ones
+  with `vs_installer.exe modify`. It logs the installed Windows SDKs and the
+  free disk space;
+- fetches every submodule except `third_party/xbyak_aarch64`, matching the
+  desktop workflow. The Vulkan SDK is not needed because the UWP build skips
+  the Vulkan backends (`src/xenia/CMakeLists.txt`);
+- creates a self-signed certificate whose subject equals the manifest
+  `Publisher` and passes its thumbprint as `XENIA_UWP_SIGN_SHA1`, so the
+  `xenia-uwp-release` target signs `build/uwp/release/Xenia-Netplay-<version>.appx`;
+- fails if the package is smaller than 50 MB, unsigned, or has a different
+  identity from `Package.appxmanifest`, and prints the packaged
+  `AppxManifest.xml`. Visual Studio adds the `Microsoft.VCLibs.140.00`
+  dependency there; the source manifest does not list it;
+- uploads the `.appx` with the matching `.cer`, plus a separate log artifact
+  (CMake configure output, MSBuild errors and warnings, `CMakeCache.txt`).
+
+To build your own package with the same signing step, create a certificate
+whose subject equals the manifest `Publisher`, then configure with
+`cmake --preset uwp -DXENIA_UWP_SIGN_SHA1=<thumbprint>`.
+
+Installing over an existing package requires a higher `Identity Version` with
+the same `Name` and `Publisher`. The package family name depends only on these
+two values, not on the certificate.

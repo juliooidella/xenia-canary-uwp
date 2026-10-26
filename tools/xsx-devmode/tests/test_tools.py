@@ -127,6 +127,61 @@ class DevPortalTests(unittest.TestCase):
         import devportal
         self.assertEqual(devportal.hex64("abc"), "YWJj")
 
+    @staticmethod
+    def _fake_portal(state_responses):
+        import devportal
+
+        class FakePortal(devportal.DevicePortal):
+            def __init__(self):
+                super().__init__("console", "u", "p")
+                self.calls = []
+                self.states = list(state_responses)
+
+            def _request(self, method, path, params=None, data=None, headers=None, timeout=60):
+                self.calls.append((method, path, params, data, headers))
+                if path == "/api/app/packagemanager/state":
+                    return self.states.pop(0)
+                return b""
+
+        return FakePortal()
+
+    def test_install_uploads_and_polls(self):
+        dp = self._fake_portal([b"", b"", b'{"Code": 0, "CodeText": "OK", "Success": true}'])
+        with tempfile.TemporaryDirectory() as td:
+            appx = Path(td) / "Xenia-Netplay-0.6.0.3.appx"
+            cert = Path(td) / "Xenia-Netplay-0.6.0.3-CI.cer"
+            appx.write_bytes(b"APPXDATA")
+            cert.write_bytes(b"CERTDATA")
+            result = dp.install(appx, [cert], poll=0)
+        self.assertTrue(result["Success"])
+        method, path, params, body, headers = dp.calls[0]
+        self.assertEqual((method, path), ("POST", "/api/app/packagemanager/package"))
+        self.assertEqual(params, {"package": "Xenia-Netplay-0.6.0.3.appx"})
+        boundary = headers["Content-Type"].split("boundary=")[1]
+        self.assertTrue(body.endswith(f"--{boundary}--\r\n".encode()))
+        self.assertIn(b'filename="Xenia-Netplay-0.6.0.3.appx"\r\n', body)
+        self.assertIn(b"APPXDATA\r\n", body)
+        self.assertIn(b'filename="Xenia-Netplay-0.6.0.3-CI.cer"\r\n', body)
+        self.assertIn(b"CERTDATA\r\n", body)
+        self.assertEqual(len(dp.calls), 4)  # upload + three state polls
+
+    def test_install_failure_raises(self):
+        dp = self._fake_portal([b'{"Code": -2147009287, "Reason": "conflict", "Success": false}'])
+        with tempfile.TemporaryDirectory() as td:
+            appx = Path(td) / "x.appx"
+            appx.write_bytes(b"A")
+            with self.assertRaises(RuntimeError) as cm:
+                dp.install(appx, poll=0)
+        self.assertIn("conflict", str(cm.exception))
+
+    def test_install_timeout(self):
+        dp = self._fake_portal([b""] * 3)
+        with tempfile.TemporaryDirectory() as td:
+            appx = Path(td) / "x.appx"
+            appx.write_bytes(b"A")
+            with self.assertRaises(TimeoutError):
+                dp.install(appx, timeout=-1, poll=0)
+
 
 if __name__ == "__main__":
     unittest.main()

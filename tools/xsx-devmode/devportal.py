@@ -3,6 +3,9 @@
 
 Endpoints (Windows Device Portal core REST API, Xbox family):
   GET    /api/app/packagemanager/packages
+  POST   /api/app/packagemanager/package?package=<file name>   (multipart: .appx [+ .cer, dependencies])
+  GET    /api/app/packagemanager/state                        (204 while installing, 200 + result)
+  POST   /api/control/restart
   POST   /api/taskmanager/app?appid=<hex64>&package=<hex64>
   DELETE /api/taskmanager/app?package=<hex64>[&forcestop=yes]
   GET    /api/filesystem/apps/files?knownfolderid=LocalAppData&packagefullname=..&path=..
@@ -23,6 +26,8 @@ LocalAppData/<package>/LocalState.
 Examples:
   devportal.py --host 192.168.0.50 --user dev --password secret packages
   devportal.py ... find xenia            # package full name + PRAID
+  devportal.py ... install Xenia-Netplay-0.6.0.3.appx --cert Xenia-Netplay-0.6.0.3-CI.cer
+  devportal.py ... restart
   devportal.py ... ls --package <pfn> --path LocalState
   devportal.py ... push --package <pfn> --path LocalState/config ./variants/base/config/5553080B.config.toml
   devportal.py ... launch --package <pfn> --appid <praid>
@@ -97,6 +102,17 @@ class DevicePortal:
         if self._csrf is None:
             self._csrf = ""  # portal without CSRF enforcement
 
+    @staticmethod
+    def _multipart(files: list[tuple[str, str, bytes]]) -> tuple[bytes, str]:
+        """files: (field name, file name, content) -> (body, Content-Type header)."""
+        boundary = uuid.uuid4().hex
+        body = b""
+        for field, filename, content in files:
+            ctype = mimetypes.guess_type(filename)[0] or "application/octet-stream"
+            body += (f"--{boundary}\r\nContent-Disposition: form-data; name=\"{field}\"; filename=\"{filename}\"\r\n"
+                     f"Content-Type: {ctype}\r\n\r\n").encode() + content + b"\r\n"
+        return body + f"--{boundary}--\r\n".encode(), f"multipart/form-data; boundary={boundary}"
+
     def _json(self, method: str, path: str, params: dict | None = None) -> dict:
         raw = self._request(method, path, params)
         return json.loads(raw.decode("utf-8")) if raw else {}
@@ -113,6 +129,32 @@ class DevicePortal:
     def launch(self, package_full_name: str, appid: str) -> None:
         self._request("POST", "/api/taskmanager/app",
                       {"appid": hex64(appid), "package": hex64(package_full_name)})
+
+    def install(self, package: Path, extras: list[Path] | tuple = (), timeout: float = 1800,
+                poll: float = 3.0) -> dict:
+        """Upload a package (plus optional .cer / dependency files) and wait for the deployment.
+
+        The portal answers the state query with 204 (empty body) while the
+        deployment runs and with 200 + the result of the last deployment after it.
+        """
+        files = [(f.name, f.name, f.read_bytes()) for f in (package, *extras)]
+        body, ctype = self._multipart(files)
+        self._request("POST", "/api/app/packagemanager/package", {"package": package.name},
+                      data=body, headers={"Content-Type": ctype}, timeout=1800)
+        deadline = time.monotonic() + timeout
+        while True:
+            raw = self._request("GET", "/api/app/packagemanager/state")
+            if raw.strip():
+                result = json.loads(raw.decode("utf-8"))
+                if not result.get("Success", True):
+                    raise RuntimeError(f"install of {package.name} failed: {result}")
+                return result
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"install of {package.name} still running after {timeout:.0f} s")
+            time.sleep(poll)
+
+    def restart(self) -> None:
+        self._request("POST", "/api/control/restart")
 
     def stop(self, package_full_name: str, force: bool = True) -> None:
         params = {"package": hex64(package_full_name)}
@@ -142,16 +184,11 @@ class DevicePortal:
         return len(data)
 
     def push(self, package_full_name: str, path: str, local: Path, remote_name: str | None = None) -> None:
-        remote_name = remote_name or local.name
-        boundary = uuid.uuid4().hex
-        ctype = mimetypes.guess_type(remote_name)[0] or "application/octet-stream"
-        body = (f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{remote_name}\"\r\n"
-                f"Content-Type: {ctype}\r\n\r\n").encode() + local.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+        body, ctype = self._multipart([("file", remote_name or local.name, local.read_bytes())])
         self._request("POST", "/api/filesystem/apps/file",
                       {"knownfolderid": "LocalAppData", "packagefullname": package_full_name,
                        "extract": "false", "path": self._path(path)},
-                      data=body, headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
-                      timeout=600)
+                      data=body, headers={"Content-Type": ctype}, timeout=600)
 
     def delete(self, package_full_name: str, path: str, filename: str) -> None:
         self._request("DELETE", "/api/filesystem/apps/file",
@@ -197,6 +234,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("filename"); p.add_argument("dest", type=Path)
     p = sub.add_parser("push"); p.add_argument("--package", required=True); p.add_argument("--path", default="LocalState")
     p.add_argument("local", type=Path); p.add_argument("--name")
+    p = sub.add_parser("install"); p.add_argument("appx", type=Path)
+    p.add_argument("--cert", type=Path); p.add_argument("--dependency", type=Path, action="append", default=[])
+    p.add_argument("--timeout", type=int, default=1800)
+    sub.add_parser("restart")
     p = sub.add_parser("launch"); p.add_argument("--package", required=True); p.add_argument("--appid", required=True)
     p = sub.add_parser("stop"); p.add_argument("--package", required=True)
     p = sub.add_parser("run-variant")
@@ -222,6 +263,11 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "push":
         dp.push(args.package, args.path, args.local, args.name)
         print("uploaded")
+    elif args.cmd == "install":
+        extras = ([args.cert] if args.cert else []) + args.dependency
+        print(dp.install(args.appx, extras, args.timeout))
+    elif args.cmd == "restart":
+        dp.restart(); print("restarting")
     elif args.cmd == "launch":
         dp.launch(args.package, args.appid); print("launched")
     elif args.cmd == "stop":

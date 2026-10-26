@@ -12,7 +12,7 @@ which keeps its files in the package `LocalState` folder.
 |---|---|
 | `gen_game_config.py` | Writes `config/<TITLEID>.config.toml` variants (cartesian product of `--vary` axes) from a baseline profile. Profile `measure` adds `log_level = 3`, `log_mask = 8` so skipped-draw lines are logged. |
 | `xenia_log_report.py` | Summarizes one or more `xenia.log` files: title id, module hash (for patch files), D3D12 feature report (ROV, tiled resources tier), shader storage timings, skipped draws, applied patches, device-lost and allocation failures. Markdown or `--json`. |
-| `devportal.py` | Xbox Device Portal client: list packages, push/pull files in `LocalState`, launch/stop the app, and `run-variant` (push config, restart, wait, pull log). |
+| `devportal.py` | Xbox Device Portal client: list and install packages, restart the console, push/pull files in `LocalState`, launch/stop the app, and `run-variant` (push config, restart, wait, pull log). |
 | `memwatch.py` | Polls the portal's system commit charge and the `xeniacanary.exe` working set into a CSV (`--until-exit`, `--duration`, `--summary`). The system commit is the counter that fills up on Series S. |
 
 ## Documents
@@ -70,3 +70,41 @@ python3 xenia_log_report.py ./runs/*.log
   option or start it manually during the wait window.
 - Keep a "play" profile (`log_level = 1`) for normal use; debug GPU logging is
   heavy on the UWP file API.
+
+## Building and installing the .appx from CI
+
+The workflow `.github/workflows/UWP_appx.yml` builds a signed test package on
+GitHub Actions (see `docs/building-uwp.md`, "Continuous integration"). A full
+build takes tens of minutes; the job limit is 5 h.
+
+```sh
+# 1. trigger: push to uwp-ci (or xsx-devmode) on the fork, or dispatch manually
+git push fork uwp-ci
+gh workflow run UWP_appx.yml -R <owner>/xenia-canary-uwp --ref uwp-ci   # needs the workflow on the default branch
+gh run list -R <owner>/xenia-canary-uwp --workflow UWP_appx.yml --limit 3
+gh run watch <run-id> -R <owner>/xenia-canary-uwp
+
+# 2. download the package and its certificate
+gh run download <run-id> -R <owner>/xenia-canary-uwp -n xenia-uwp-appx-<version>-<sha> -D ./appx
+
+# 3. install through the Device Portal, restart, start the app, measure
+python3 devportal.py --host <ip> --user <u> --password <p> install \
+    ./appx/build/uwp/release/Xenia-Netplay-<version>.appx --cert ./appx/ci-cert/Xenia-Netplay-<version>-CI.cer
+python3 devportal.py ... restart
+python3 devportal.py ... find xenia     # new PackageFullName ends in _<version>_x64__1qrqqmyv3f0wj
+python3 devportal.py ... launch --package <PackageFullName> --appid <AppId>
+python3 memwatch.py --host <ip> --user <u> --password <p> --out runs/ci-boot.csv --duration 180
+```
+
+On a fork, open the repository's Actions tab once and enable workflows;
+until then GitHub registers no workflows and a push starts no runs.
+
+`install` uploads the package and any `--cert` or `--dependency` files in one
+multipart request (`POST /api/app/packagemanager/package`). It then polls
+`/api/app/packagemanager/state` until the portal returns the deployment result,
+and fails if `Success` is false. The CI package keeps the identity name and
+publisher `CN=DanP142` and uses a higher version, so it updates the installed
+package in place. Its signing certificate differs from the original package's.
+If the console rejects the update for that reason, uninstall the old package
+first. Uninstalling also deletes its `LocalState` (configs, logs, profiles), so
+pull what you need first.
