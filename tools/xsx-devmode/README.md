@@ -13,6 +13,7 @@ which keeps its files in the package `LocalState` folder.
 | `gen_game_config.py` | Writes `config/<TITLEID>.config.toml` variants (cartesian product of `--vary` axes) from a baseline profile. Profile `measure` adds `log_level = 3`, `log_mask = 8` so skipped-draw lines are logged. |
 | `xenia_log_report.py` | Summarizes one or more `xenia.log` files: title id, module hash (for patch files), D3D12 feature report (ROV, tiled resources tier), shader storage timings, skipped draws, applied patches, device-lost and allocation failures. Markdown or `--json`. |
 | `devportal.py` | Xbox Device Portal client: list and install packages, restart the console, push/pull files in `LocalState`, launch/stop the app, and `run-variant` (push config, restart, wait, pull log). |
+| `xiso_extract.py` | Unpacks an Xbox 360 disc image (plain XISO or XGD1/2/3) into a folder with `default.xex`, which is the only disc layout the UWP frontend lists from a USB drive. Pure Python, `--dry-run` to validate. |
 | `memwatch.py` | Polls the portal's system commit charge and the `xeniacanary.exe` working set into a CSV (`--until-exit`, `--duration`, `--summary`). The system commit is the counter that fills up on Series S. |
 
 ## Documents
