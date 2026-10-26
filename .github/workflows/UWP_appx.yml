@@ -1,0 +1,166 @@
+name: UWP appx (x86-64)
+
+# Builds the signed test package (.appx) of the UWP / Xbox frontend with the
+# CMake presets documented in docs/building-uwp.md.
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - xsx-devmode
+      - uwp-ci
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  appx:
+    name: Build .appx
+    runs-on: windows-2022
+    timeout-minutes: 300
+
+    env:
+      POWERSHELL_TELEMETRY_OPTOUT: 1
+      LOG_DIR: ${{ github.workspace }}\ci-logs
+      CERT_DIR: ${{ github.workspace }}\ci-cert
+
+    defaults:
+      run:
+        shell: pwsh
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Check Visual Studio UWP workload
+        run: |-
+          New-Item -ItemType Directory -Force $env:LOG_DIR | Out-Null
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -version "[17.0,18.0)" -format json | ConvertFrom-Json
+          if (-not $vs) { echo "::error::No Visual Studio 2022 instance found"; exit 1 }
+          echo "Visual Studio: $($vs.displayName) $($vs.catalog.productDisplayVersion) at $($vs.installationPath)"
+
+          $required = @(
+            "Microsoft.VisualStudio.Workload.Universal",
+            "Microsoft.VisualStudio.ComponentGroup.UWP.VC"
+          )
+          function Get-Missing {
+            $required | Where-Object {
+              -not (& $vswhere -latest -products * -version "[17.0,18.0)" -requires $_ -property installationPath)
+            }
+          }
+          foreach ($id in $required) {
+            $found = & $vswhere -latest -products * -version "[17.0,18.0)" -requires $id -property installationPath
+            echo ("{0}: {1}" -f $id, $(if ($found) { "present" } else { "MISSING" }))
+          }
+
+          $missing = @(Get-Missing)
+          if ($missing.Count -gt 0) {
+            $installer = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vs_installer.exe"
+            $installArgs = @("modify", "--installPath", "`"$($vs.installationPath)`"")
+            foreach ($id in $missing) { $installArgs += @("--add", $id) }
+            $installArgs += @("--includeRecommended", "--quiet", "--norestart", "--nocache")
+            echo "Installing: $($missing -join ', ')"
+            $p = Start-Process -FilePath $installer -ArgumentList $installArgs -Wait -PassThru
+            echo "vs_installer exit code: $($p.ExitCode)"
+            if ($p.ExitCode -ne 0 -and $p.ExitCode -ne 3010) { exit 1 }
+            $missing = @(Get-Missing)
+            if ($missing.Count -gt 0) { echo "::error::Still missing: $($missing -join ', ')"; exit 1 }
+          }
+
+          echo "Windows SDKs:"
+          Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Include" -Directory | ForEach-Object { echo "  $($_.Name)" }
+          cmake --version
+          python --version
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n="FreeGB";e={[math]::Round($_.Free/1GB,1)}}, Root
+
+      - name: Download submodules
+        run: |- # Exclude unneeded submodules
+          $SUBMODULES=(Select-String -CaseSensitive '(?<=path = )(?!third_party\/xbyak_aarch64).+' .gitmodules).Matches.Value
+          git submodule update --init --depth=1 -j $env:NUMBER_OF_PROCESSORS $SUBMODULES
+
+      - name: Create test signing certificate
+        id: cert
+        run: |-
+          # The package publisher and the certificate subject must be identical.
+          [xml]$manifest = Get-Content xenia-canary-uwp\Package.appxmanifest
+          $publisher = $manifest.Package.Identity.Publisher
+          $version = $manifest.Package.Identity.Version
+          echo "Manifest: Publisher=$publisher Version=$version"
+          $cert = New-SelfSignedCertificate -Type Custom -Subject $publisher `
+            -KeyUsage DigitalSignature -FriendlyName "Xenia UWP CI" `
+            -CertStoreLocation Cert:\CurrentUser\My `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+          if ($cert.Subject -cne $publisher) {
+            echo "::error::Certificate subject '$($cert.Subject)' differs from publisher '$publisher'"
+            exit 1
+          }
+          New-Item -ItemType Directory -Force $env:CERT_DIR | Out-Null
+          Export-Certificate -Cert $cert -FilePath "$env:CERT_DIR\Xenia-Netplay-$version-CI.cer" -Type CERT | Out-Null
+          echo "Certificate $($cert.Thumbprint) subject=$($cert.Subject)"
+          echo "thumbprint=$($cert.Thumbprint)" >> $env:GITHUB_OUTPUT
+          echo "version=$version" >> $env:GITHUB_OUTPUT
+          echo "publisher=$publisher" >> $env:GITHUB_OUTPUT
+
+      - name: Configure (cmake --preset uwp)
+        run: |-
+          cmake --preset uwp "-DXENIA_UWP_SIGN_SHA1=${{ steps.cert.outputs.thumbprint }}" 2>&1 |
+            Tee-Object -FilePath "$env:LOG_DIR\cmake-configure.log"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build (cmake --build --preset uwp-release)
+        run: |-
+          cmake --build --preset uwp-release -- /m:3 /p:CL_MPCount=2 `
+            "/flp1:logfile=$env:LOG_DIR\msbuild-errors.log;errorsonly" `
+            "/flp2:logfile=$env:LOG_DIR\msbuild-warnings.log;warningsonly"
+          $code = $LASTEXITCODE
+          Get-PSDrive -PSProvider FileSystem | Format-Table Name, @{n="FreeGB";e={[math]::Round($_.Free/1GB,1)}}, Root
+          exit $code
+
+      - name: Verify package
+        run: |-
+          $appx = @(Get-ChildItem build\uwp\release\*.appx)
+          if ($appx.Count -ne 1) { echo "::error::Expected one .appx in build\uwp\release, found $($appx.Count)"; exit 1 }
+          $appx = $appx[0]
+          $mb = [math]::Round($appx.Length / 1MB, 1)
+          echo "$($appx.Name): $mb MB"
+          if ($appx.Length -lt 50MB) { echo "::error::$($appx.Name) is only $mb MB (< 50 MB)"; exit 1 }
+
+          $unpacked = Join-Path $env:RUNNER_TEMP "appx-unpacked"
+          $zip = Join-Path $env:RUNNER_TEMP "package.zip"
+          Copy-Item $appx.FullName $zip
+          Expand-Archive -Path $zip -DestinationPath $unpacked -Force
+          if (-not (Test-Path "$unpacked\AppxSignature.p7x")) { echo "::error::Package is not signed (no AppxSignature.p7x)"; exit 1 }
+
+          Get-Content "$unpacked\AppxManifest.xml" | Tee-Object -FilePath "$env:LOG_DIR\AppxManifest.xml"
+          [xml]$m = Get-Content "$unpacked\AppxManifest.xml"
+          $id = $m.Package.Identity
+          echo "Identity: Name=$($id.Name) Version=$($id.Version) Publisher=$($id.Publisher) Arch=$($id.ProcessorArchitecture)"
+          foreach ($d in $m.Package.Dependencies.ChildNodes) {
+            echo "Dependency: $($d.LocalName) Name=$($d.Name) MinVersion=$($d.MinVersion) MaxVersionTested=$($d.MaxVersionTested)"
+          }
+          if ($id.Version -ne "${{ steps.cert.outputs.version }}") { echo "::error::Package version $($id.Version) differs from the source manifest"; exit 1 }
+          if ($id.Publisher -cne "${{ steps.cert.outputs.publisher }}") { echo "::error::Package publisher $($id.Publisher) differs from the source manifest"; exit 1 }
+
+      - name: Upload package
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenia-uwp-appx-${{ steps.cert.outputs.version }}-${{ github.sha }}
+          path: |
+            build/uwp/release/*.appx
+            ci-cert/*.cer
+          if-no-files-found: error
+
+      - name: Upload logs
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: xenia-uwp-logs-${{ github.sha }}
+          path: |
+            ci-logs/
+            build/uwp/CMakeCache.txt
+            build/uwp/CMakeFiles/CMakeConfigureLog.yaml
+          if-no-files-found: warn
