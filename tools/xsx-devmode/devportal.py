@@ -161,7 +161,12 @@ class DevicePortal:
             time.sleep(poll)
 
     def restart(self) -> None:
-        self._request("POST", "/api/control/restart")
+        # The portal rejects a POST without Content-Length (HTTP 411), and the
+        # console often reboots before answering, so a dropped read means success.
+        try:
+            self._request("POST", "/api/control/restart", data=b"", timeout=30)
+        except (TimeoutError, ConnectionError, urllib.error.URLError):
+            pass
 
     def stop(self, package_full_name: str, force: bool = True) -> None:
         params = {"package": hex64(package_full_name)}

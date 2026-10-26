@@ -91,11 +91,24 @@ gh run download <run-id> -R <owner>/xenia-canary-uwp -n xenia-uwp-appx-<version>
 # 3. install through the Device Portal, restart, start the app, measure
 python3 devportal.py --host <ip> --user <u> --password <p> install \
     ./appx/build/uwp/release/Xenia-Netplay-<version>.appx --cert ./appx/ci-cert/Xenia-Netplay-<version>-CI.cer
+# on the console: Dev Home > Xenia Netplay > View details > App type = Game
 python3 devportal.py ... restart
 python3 devportal.py ... find xenia     # new PackageFullName ends in _<version>_x64__1qrqqmyv3f0wj
 python3 devportal.py ... launch --package <PackageFullName> --appid <AppId>
 python3 memwatch.py --host <ip> --user <u> --password <p> --out runs/ci-boot.csv --duration 180
 ```
+
+Every install registers the package as an App, so set it back to Game on
+the console after each install. As an App, Xenia logs
+`UWP app memory usage: ... limit: 1024 MiB`, fails with `XmaContext ...:
+Couldn't allocate context` and exits about 15 s after launch. As a Game the
+limit is 5120 MiB. The portal's `systemperf` counters follow the same
+partition: memwatch reports a 3168 MiB commit limit for an App and 8288 MiB
+for a Game.
+
+`restart` sends an empty POST body because the portal answers HTTP 411
+without a Content-Length. The console reboots in under 20 s, often before
+it answers, so a read timeout counts as success.
 
 On a fork, open the repository's Actions tab once and enable workflows;
 until then GitHub registers no workflows and a push starts no runs.
@@ -105,7 +118,8 @@ multipart request (`POST /api/app/packagemanager/package`). It then polls
 `/api/app/packagemanager/state` until the portal returns the deployment result,
 and fails if `Success` is false. The CI package keeps the identity name and
 publisher `CN=DanP142` and uses a higher version, so it updates the installed
-package in place. Its signing certificate differs from the original package's.
-If the console rejects the update for that reason, uninstall the old package
-first. Uninstalling also deletes its `LocalState` (configs, logs, profiles), so
-pull what you need first.
+package in place. On 2026-10-26 the console accepted 0.6.0.3 over 0.6.0.2 in
+12 s, even though the CI certificate differs from the original one, and kept
+`LocalState`. If an update is ever rejected, uninstall the old package first.
+Uninstalling deletes its `LocalState` (configs, logs, profiles), so pull what
+you need first.

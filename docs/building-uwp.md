@@ -73,4 +73,7 @@ SDK replaces the source value) and `Microsoft.VCLibs.140.00 >= 14.0.33519.0`.
 
 Installing over an existing package requires a higher `Identity Version` with
 the same `Name` and `Publisher`. The package family name depends only on these
-two values, not on the certificate.
+two values, not on the certificate. On Xbox Dev Mode an install registers
+the package as an App with a 1 GB memory limit. Set it to Game in Dev Home
+(View details > App type) after each install, or Xenia exits shortly after
+launch.
