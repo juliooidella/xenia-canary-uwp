@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
@@ -31,6 +32,7 @@
 #include "XeniaUWP.h"
 #include "app_launch_state.h"
 #include "protocol_activation.h"
+#include "third_party/fmt/include/fmt/format.h"
 #include "xenia/base/logging.h"
 #include "xenia/config.h"
 
@@ -61,6 +63,100 @@ uint64_t QueryGpuMemoryUsage() {
     return 0;
   }
   return info.CurrentUsage;
+}
+
+// Copies memory that another thread may release meanwhile.
+bool TryCopyMemory(void* dest, const void* source, size_t size) {
+  __try {
+    memcpy(dest, source, size);
+    return true;
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    return false;
+  }
+}
+
+// Logs where the private commit of this process sits: totals per allocation
+// size and the largest allocations, with their first bytes to tell the data.
+void LogPrivateAllocations(uint64_t app_usage) {
+  struct Allocation {
+    uintptr_t base;
+    uintptr_t first_committed;
+    size_t committed;
+    DWORD protect;
+  };
+  std::vector<Allocation> allocations;
+  MEMORY_BASIC_INFORMATION info;
+  const uint8_t* address = nullptr;
+  while (VirtualQuery(address, &info, sizeof(info)) == sizeof(info)) {
+    if (info.State == MEM_COMMIT && info.Type == MEM_PRIVATE) {
+      uintptr_t base = reinterpret_cast<uintptr_t>(info.AllocationBase);
+      if (!allocations.empty() && allocations.back().base == base) {
+        allocations.back().committed += info.RegionSize;
+      } else {
+        allocations.push_back(
+            {base, reinterpret_cast<uintptr_t>(info.BaseAddress),
+             info.RegionSize, info.Protect});
+      }
+    }
+    const uint8_t* next =
+        static_cast<const uint8_t*>(info.BaseAddress) + info.RegionSize;
+    if (next <= address) {
+      break;
+    }
+    address = next;
+  }
+
+  constexpr size_t kBucketLimits[] = {64ull << 10, 1ull << 20, 16ull << 20,
+                                      256ull << 20, SIZE_MAX};
+  size_t bucket_count[5] = {};
+  size_t bucket_bytes[5] = {};
+  size_t total = 0;
+  for (const Allocation& allocation : allocations) {
+    size_t bucket = 0;
+    while (allocation.committed > kBucketLimits[bucket]) {
+      ++bucket;
+    }
+    ++bucket_count[bucket];
+    bucket_bytes[bucket] += allocation.committed;
+    total += allocation.committed;
+  }
+  XELOGI(
+      "Private allocations at {} MiB app usage: {} MiB in {} allocations; "
+      "<=64K {}x {} MiB, <=1M {}x {} MiB, <=16M {}x {} MiB, <=256M {}x {} "
+      "MiB, >256M {}x {} MiB",
+      app_usage >> 20, total >> 20, allocations.size(), bucket_count[0],
+      bucket_bytes[0] >> 20, bucket_count[1], bucket_bytes[1] >> 20,
+      bucket_count[2], bucket_bytes[2] >> 20, bucket_count[3],
+      bucket_bytes[3] >> 20, bucket_count[4], bucket_bytes[4] >> 20);
+
+  std::sort(allocations.begin(), allocations.end(),
+            [](const Allocation& a, const Allocation& b) {
+              return a.committed > b.committed;
+            });
+  constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                              PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                              PAGE_EXECUTE_WRITECOPY;
+  for (size_t i = 0; i < std::min<size_t>(allocations.size(), 12); ++i) {
+    const Allocation& allocation = allocations[i];
+    std::string bytes;
+    uint8_t data[32];
+    if ((allocation.protect & kReadable) &&
+        !(allocation.protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+        TryCopyMemory(data,
+                      reinterpret_cast<const void*>(allocation.first_committed),
+                      sizeof(data))) {
+      for (size_t j = 0; j < 32; ++j) {
+        bytes += fmt::format("{:02X}", data[j]);
+      }
+      bytes += ' ';
+      for (size_t j = 0; j < 32; ++j) {
+        bytes += (data[j] >= 0x20 && data[j] < 0x7F) ? char(data[j]) : '.';
+      }
+    }
+    XELOGI("  private allocation {:016X}: {} MiB, protect {:X}, {}",
+           allocation.base, allocation.committed >> 20, allocation.protect,
+           bytes);
+  }
 }
 
 }  // namespace
@@ -238,6 +334,7 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
     uint64_t logged_memory_usage = 0;
     uint64_t peak_memory_usage = 0;
     bool memory_usage_available = true;
+    uint64_t next_allocation_report = 2ull << 30;
 
     while (!UWP::HasQuit()) {
       CoreWindow::GetForCurrentThread().Dispatcher().ProcessEvents(
@@ -255,6 +352,11 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
           uint64_t delta = usage > logged_memory_usage
                                ? usage - logged_memory_usage
                                : logged_memory_usage - usage;
+          if (usage >= next_allocation_report) {
+            LogPrivateAllocations(usage);
+            next_allocation_report += usage < (4ull << 30) ? (1ull << 30)
+                                                           : (512ull << 20);
+          }
           if (delta >= kMemoryLogStep) {
             logged_memory_usage = usage;
             uint64_t private_commit = winrt::Windows::System::MemoryManager::
