@@ -88,6 +88,16 @@ A hipótese do mapeamento da `.iso` está **descartada**: no UWP o `DiscImageDev
 limitado a 256/128 MB e o shared memory do D3D12 é um buffer fixo de 512 MB no UWP. O crescimento é do
 host; o build 0.6.0.6 separa commit privado (CPU) de memória da GPU no mesmo log.
 
+Teste 4 com o build 0.6.0.6 (`runs/t4.log`): a memória que cresce é **commit privado da CPU**, não
+GPU. Frontend: total 636 MiB, privado 105, GPU 0. Após montar a `.iso`: 1708 / 1148 / 632. Última
+linha antes do encerramento: **5070 / 4359 / 717 MiB**. O commit privado não inclui a memória do guest
+nem o código do JIT (ambos em sections; o pré-commit físico de 512 MB aparece no total, não no
+privado). Descartados por leitura de código: leitura da `.iso` (`ReadFile` direto no buffer,
+`filesystem_win.cc:131`), `DeferredCommandList` (8 MB fixo), upload ranges (512 KB fixo), shader
+storage (174 pipelines). O dump ao vivo do portal (`/api/debug/dump/usermode/live?pid=`) responde
+HTTP 500 para o processo do Xenia. O build 0.6.0.7 registra, a 2/3/4 GB e depois a cada 512 MiB, as
+maiores alocações privadas (`VirtualQuery`) com os primeiros bytes.
+
 Consequência para o plano: o problema não é o footprint do frontend. Resta descobrir quanto da
 partição de 5 GB o Conviction usa ao carregar, e se o crash de ponteiro nulo de 2026-10-26 tem
 relação com memória. Próxima instrumentação: logar `AppMemoryUsage` periodicamente durante o jogo.
