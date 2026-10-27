@@ -66,6 +66,18 @@ Verificado:
 - Com o pré-commit desligado o frontend abre normalmente (jogos listados, sem crash). Ainda não foi
   testado em jogo; o risco é a GPU tocar páginas físicas não commitadas.
 
+Teste A (Conviction pela `.iso`, `precommit_physical_memory = false`, `runs/testA*.log/.csv`): o jogo
+passou do ponto em que o 0.6.0.3 morria (os dois `CRASH DUMP` logo depois de `Dare::HLPLoadingManager`),
+fez uploads para a GPU e leu `\Default\Sounds\Xbox360\English` em loop. Depois travou numa tela quase preta
+com artefatos verdes, sem crash, CPU ~67% constante. O working set do processo subiu de 952 MiB para
+**3761 MiB** e parou. Apareceram 6× `Invalid upload range for GPU: 0001CB7E length 000000E1`
+(`d3d12_shared_memory.cc:351`). Esse teste checa a tabela de páginas do guest
+(`BaseHeap::QueryRangeAccess`), não o commit do host, então a GPU recebeu um intervalo que o guest não
+alocou; não depende do pré-commit. Uma execução de cada variante só: não dá para afirmar que o pré-commit
+causou a diferença. Hipótese: o `DiscImageDevice` mapeia a `.iso` inteira (`disc_image_device.cc:50`,
+`MappedMemory::Open`), e as páginas lidas do arquivo entram no working set da partição de 5 GB. O build
+0.6.0.5 (log periódico do `AppMemoryUsage`) separa memória privada de páginas de arquivo.
+
 Consequência para o plano: o problema não é o footprint do frontend. Resta descobrir quanto da
 partição de 5 GB o Conviction usa ao carregar, e se o crash de ponteiro nulo de 2026-10-26 tem
 relação com memória. Próxima instrumentação: logar `AppMemoryUsage` periodicamente durante o jogo.
