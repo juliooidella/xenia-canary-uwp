@@ -78,6 +78,16 @@ causou a diferença. Hipótese: o `DiscImageDevice` mapeia a `.iso` inteira (`di
 `MappedMemory::Open`), e as páginas lidas do arquivo entram no working set da partição de 5 GB. O build
 0.6.0.5 (log periódico do `AppMemoryUsage`) separa memória privada de páginas de arquivo.
 
+Teste 1 com o build 0.6.0.5 (`runs/t1.log`, `runs/t1-conviction-base.csv`, configuração padrão):
+**causa da queda confirmada**. O log periódico mostra `UWP app memory usage` 636 MiB no frontend, 1689
+MiB logo após montar a `.iso`, e depois subida contínua enquanto o jogo lê sons, vídeos e
+`\Default\UMDs` (2207 → 3011 → 4063 → 5082 MiB). Com 5082 de 5120 MiB o sistema encerrou o app (volta
+à home do Dev Mode, sem `CRASH DUMP`). Nenhum warning de alocação do guest. Working set de pico 3992 MiB.
+A hipótese do mapeamento da `.iso` está **descartada**: no UWP o `DiscImageDevice` lê por
+`file_handle_->Read` (`disc_image_device.cc:102-114`), sem mapear. O cache de texturas já estava
+limitado a 256/128 MB e o shared memory do D3D12 é um buffer fixo de 512 MB no UWP. O crescimento é do
+host; o build 0.6.0.6 separa commit privado (CPU) de memória da GPU no mesmo log.
+
 Consequência para o plano: o problema não é o footprint do frontend. Resta descobrir quanto da
 partição de 5 GB o Conviction usa ao carregar, e se o crash de ponteiro nulo de 2026-10-26 tem
 relação com memória. Próxima instrumentação: logar `AppMemoryUsage` periodicamente durante o jogo.
