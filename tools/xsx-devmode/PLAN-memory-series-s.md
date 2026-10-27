@@ -37,6 +37,39 @@ que reutiliza `src/xenia/memory.cc`, `src/xenia/base/memory_win.cc` e
   falhou antes. Hipótese: falha de outra natureza (algum serviço do kernel/XAM devolvendo nulo) ou
   uma alocação do guest que falha sem log. Não houve memwatch nessa execução.
 
+## 1b. Medição da Etapa 1 (2026-10-26, build 0.6.0.4 `uwp-ci@151a3b1`) — revisa a hipótese central
+
+Build com o log `Host commit <passo>` (`GlobalMemoryStatusEx` dentro do app) e as cvars
+`compact_guest_mapping` e `precommit_physical_memory` (`src/xenia/memory.cc`). Cada variante foi
+medida com restart, frontend aberto e memwatch (`runs/mem-<variante>.csv/.log`):
+
+| Variante | Pico do commit do sistema (portal) | `UWP app memory usage` no frontend |
+|---|---|---|
+| base | 6853 MiB | 637 MiB |
+| `compact_guest_mapping = true` | 6816 MiB | 635 MiB |
+| `precommit_physical_memory = false` | 6330 MiB | 141 MiB |
+| as duas | 6326 MiB | 141 MiB |
+
+Verificado:
+- **O salto de ~6 GB acontece no lançamento do app, antes do Xenia rodar.** No CSV base, em t=2,2 s
+  o commit era 831 MiB com limite 3168 MiB; em t=10,6 s (primeira amostra com o processo) já era
+  6843 MiB, com limite 8288 MiB, ou seja, **+5120 MiB, exatamente o limite do app tipo Game**. O
+  `systemperf` do portal mostra a visão do SystemOS (total 1280 MiB), em que a partição do jogo
+  entra inteira como commit. Não é custo do Xenia; a hipótese central da seção 2 (section de 4,5 GB
+  cobrada) está **refutada**.
+- O orçamento real é a partição de **5120 MiB**. O frontend usa 637 MiB, dos quais ~500 MiB são o
+  pré-commit físico (item 3). Sem ele, 141 MiB.
+- `compact_guest_mapping` não muda nada (item 1 sem ganho).
+- `GlobalMemoryStatusEx` dentro do app não enxerga o commit da section: o pré-commit de 512 MB
+  aparece como 72 → 72 MiB. Os números `Host commit` só servem para alocações privadas; para o
+  orçamento use `MemoryManager::AppMemoryUsage`.
+- Com o pré-commit desligado o frontend abre normalmente (jogos listados, sem crash). Ainda não foi
+  testado em jogo; o risco é a GPU tocar páginas físicas não commitadas.
+
+Consequência para o plano: o problema não é o footprint do frontend. Resta descobrir quanto da
+partição de 5 GB o Conviction usa ao carregar, e se o crash de ponteiro nulo de 2026-10-26 tem
+relação com memória. Próxima instrumentação: logar `AppMemoryUsage` periodicamente durante o jogo.
+
 ## 2. Onde o custo nasce (código)
 
 1. **Section única de 4,5 GB** — `src/xenia/memory.cc`, `Memory::Initialize()`:
