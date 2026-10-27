@@ -5,8 +5,13 @@
 #include <dxgi1_4.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstring>
+#include <cstdlib>
+#include <malloc.h>
+#include <new>
 #include <string>
 #include <utility>
 #include <vector>
@@ -37,6 +42,84 @@
 #include "xenia/config.h"
 
 namespace {
+
+constexpr size_t kTrackedAllocationCount = 4096;
+constexpr size_t kTrackedAllocationThreshold = 1ull << 20;
+constexpr USHORT kTrackedStackDepth = 8;
+
+struct TrackedAllocation {
+  std::atomic<uint64_t> sequence{0};
+  size_t size = 0;
+  uintptr_t address = 0;
+  DWORD thread_id = 0;
+  USHORT frame_count = 0;
+  uintptr_t frames[kTrackedStackDepth] = {};
+};
+
+std::array<TrackedAllocation, kTrackedAllocationCount> tracked_allocations;
+std::atomic<uint64_t> tracked_allocation_count{0};
+
+void RecordTrackedAllocation(size_t size, void* address) {
+  if (size < kTrackedAllocationThreshold) {
+    return;
+  }
+  uint64_t sequence =
+      tracked_allocation_count.fetch_add(1, std::memory_order_relaxed) + 1;
+  TrackedAllocation& event =
+      tracked_allocations[(sequence - 1) % kTrackedAllocationCount];
+  event.sequence.store(0, std::memory_order_release);
+  event.size = size;
+  event.address = reinterpret_cast<uintptr_t>(address);
+  event.thread_id = GetCurrentThreadId();
+  void* frames[kTrackedStackDepth] = {};
+  event.frame_count = CaptureStackBackTrace(
+      2, kTrackedStackDepth, frames, nullptr);
+  for (USHORT i = 0; i < event.frame_count; ++i) {
+    event.frames[i] = reinterpret_cast<uintptr_t>(frames[i]);
+  }
+  event.sequence.store(sequence, std::memory_order_release);
+}
+
+void LogTrackedAllocations(uint64_t& last_logged_sequence) {
+  uint64_t last_sequence =
+      tracked_allocation_count.load(std::memory_order_acquire);
+  uint64_t first_sequence = last_logged_sequence + 1;
+  if (last_sequence >= kTrackedAllocationCount &&
+      first_sequence <= last_sequence - kTrackedAllocationCount) {
+    XELOGW("Large C++ allocation trace dropped {} events",
+           last_sequence - kTrackedAllocationCount - first_sequence + 1);
+    first_sequence = last_sequence - kTrackedAllocationCount + 1;
+  }
+  HMODULE executable = GetModuleHandleW(nullptr);
+  uintptr_t image_base = reinterpret_cast<uintptr_t>(executable);
+  auto* dos_header = reinterpret_cast<const IMAGE_DOS_HEADER*>(executable);
+  auto* nt_headers = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+      image_base + dos_header->e_lfanew);
+  uintptr_t image_end = image_base + nt_headers->OptionalHeader.SizeOfImage;
+  for (uint64_t sequence = first_sequence; sequence <= last_sequence;
+       ++sequence) {
+    const TrackedAllocation& event =
+        tracked_allocations[(sequence - 1) % kTrackedAllocationCount];
+    if (event.sequence.load(std::memory_order_acquire) != sequence) {
+      continue;
+    }
+    std::string stack;
+    for (USHORT i = 0; i < event.frame_count; ++i) {
+      uintptr_t frame = event.frames[i];
+      if (!stack.empty()) {
+        stack += ',';
+      }
+      if (frame >= image_base && frame < image_end) {
+        stack += fmt::format("+{:X}", frame - image_base);
+      } else {
+        stack += fmt::format("{:016X}", frame);
+      }
+    }
+    XELOGI("Large C++ allocation #{}: {} KiB at {:016X}, thread {}, stack [{}]",
+           sequence, event.size >> 10, event.address, event.thread_id, stack);
+  }
+  last_logged_sequence = last_sequence;
+}
 
 // GPU memory charged to this process on the first adapter; 0 if unknown.
 uint64_t QueryGpuMemoryUsage() {
@@ -160,6 +243,70 @@ void LogPrivateAllocations(uint64_t app_usage) {
 }
 
 }  // namespace
+
+void* operator new(std::size_t size) {
+  if (void* allocation = std::malloc(size ? size : 1)) {
+    RecordTrackedAllocation(size, allocation);
+    return allocation;
+  }
+  throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t size) {
+  if (void* allocation = std::malloc(size ? size : 1)) {
+    RecordTrackedAllocation(size, allocation);
+    return allocation;
+  }
+  throw std::bad_alloc();
+}
+
+void operator delete(void* allocation) noexcept { std::free(allocation); }
+
+void operator delete[](void* allocation) noexcept { std::free(allocation); }
+
+void operator delete(void* allocation, std::size_t) noexcept {
+  std::free(allocation);
+}
+
+void operator delete[](void* allocation, std::size_t) noexcept {
+  std::free(allocation);
+}
+
+void* operator new(std::size_t size, std::align_val_t alignment) {
+  if (void* allocation = _aligned_malloc(size ? size : 1,
+                                         static_cast<size_t>(alignment))) {
+    RecordTrackedAllocation(size, allocation);
+    return allocation;
+  }
+  throw std::bad_alloc();
+}
+
+void* operator new[](std::size_t size, std::align_val_t alignment) {
+  if (void* allocation = _aligned_malloc(size ? size : 1,
+                                         static_cast<size_t>(alignment))) {
+    RecordTrackedAllocation(size, allocation);
+    return allocation;
+  }
+  throw std::bad_alloc();
+}
+
+void operator delete(void* allocation, std::align_val_t) noexcept {
+  _aligned_free(allocation);
+}
+
+void operator delete[](void* allocation, std::align_val_t) noexcept {
+  _aligned_free(allocation);
+}
+
+void operator delete(void* allocation, std::size_t,
+                     std::align_val_t) noexcept {
+  _aligned_free(allocation);
+}
+
+void operator delete[](void* allocation, std::size_t,
+                       std::align_val_t) noexcept {
+  _aligned_free(allocation);
+}
 #include "xenia/ui/imgui_dialog.h"
 
 using namespace winrt;
@@ -335,6 +482,7 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
     uint64_t peak_memory_usage = 0;
     bool memory_usage_available = true;
     uint64_t next_allocation_report = 2ull << 30;
+    uint64_t last_logged_allocation_sequence = 0;
 
     while (!UWP::HasQuit()) {
       CoreWindow::GetForCurrentThread().Dispatcher().ProcessEvents(
@@ -354,6 +502,7 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
                                : logged_memory_usage - usage;
           if (usage >= next_allocation_report) {
             LogPrivateAllocations(usage);
+            LogTrackedAllocations(last_logged_allocation_sequence);
             next_allocation_report += usage < (4ull << 30) ? (1ull << 30)
                                                            : (512ull << 20);
           }

@@ -22,6 +22,7 @@ target_compile_definitions(xenia-uwp PRIVATE
   XBYAK_NO_OP_NAMES XBYAK_ENABLE_OMITTED_OPERAND CURL_STATICLIB MINIUPNP_STATICLIB
 )
 target_compile_options(xenia-uwp PRIVATE /bigobj)
+target_link_options(xenia-uwp PRIVATE "/MAP:${CMAKE_BINARY_DIR}/xeniacanary.map")
 
 # This runtime has a different ABI from Xenia's static XMA decoder. Restrict
 # its matching headers to the dynamic loaders' translation units.

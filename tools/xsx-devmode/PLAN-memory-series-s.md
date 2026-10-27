@@ -187,3 +187,48 @@ das views** (fundir as views físicas espelhadas, dropar `0x100000000–0x11FFFF
 - Desempenho de GPU/CPU (ROV indisponível no Series S, tiled resources tier 1): só depois que o jogo
   carregar.
 - Blacklist: mais pesado que Conviction; entra como segundo alvo depois do aceite acima.
+
+## 8. Próxima instrumentação e Settings (2026-10-27)
+
+Build 0.6.0.7 (`runs/t5-final.log`): o sistema encerrou o Conviction ao chegar a
+5064/5120 MiB de `AppMemoryUsage`. O relatório mediu 4354 MiB de commit privado
+e 715 MiB de GPU. Em 4694 MiB de uso, os maiores blocos privados incluíam um
+bloco de 512 MiB, três de 32 MiB e vários de 20 MiB; os de 20 MiB começam com
+`XbMeMbX`. Isso ainda não identifica quem os aloca.
+
+Build 0.6.0.8 registra pilhas de chamada de toda alocação C++ (`operator new`
+normal, array e alinhada) de pelo menos 1 MiB. Mantém os eventos num buffer
+fixo sem alocar dentro do hook, e os descarrega junto aos relatórios de
+`VirtualQuery` nos marcos de 2, 3 e 4 GiB e a cada 512 MiB depois disso. O log
+traz RVA das pilhas no executável; o artefato de logs inclui
+`build/uwp/xeniacanary.map` para traduzir RVA em função. Alocações feitas por
+`malloc`, COM ou diretamente por APIs Win32 não passam pelo `operator new`;
+se os blocos de 20 MiB não aparecerem nesse rastreamento, o passo seguinte é
+instrumentar essas famílias de API separadamente.
+
+Settings já verificados no perfil do Conviction e no config global:
+- cache de texturas: `soft=128 MiB`, `hard=256 MiB`;
+- escala interna: `draw_resolution_scale_x/y=1`;
+- cache de pipeline: 2 threads;
+- `readback_memexport=true`, `render_target_path_d3d12="rov"`;
+- `d3d12_enable_tiled_shared_memory=false` (padrão UWP), enquanto `tiled_shared_memory=true`.
+
+Esses valores já são conservadores. O `memwatch` separou a GPU (~715 MiB) do
+commit privado da CPU (até 4354 MiB); reduzir cache de textura ou escala pode
+economizar memória da GPU, mas não explica nem deve liberar vários GiB privados.
+Dois testes de Settings ainda são razoáveis, após identificar a alocação:
+1. `readback_memexport=false` (configuração por jogo): pode reduzir staging e
+   sincronização CPU/GPU, mas pode quebrar a imagem do jogo; registrar app,
+   commit privado e GPU separadamente.
+2. `texture_cache_memory_limit_soft=32` e `hard=64` MiB (configuração por jogo):
+   mede o teto de economia de GPU; confirmar se a imagem continua correta.
+3. `d3d12_enable_tiled_shared_memory=true` (configuração global): tenta usar
+   recursos reservados/tiled para o buffer de memória compartilhada de 512 MiB.
+   O código avisa que sem tiled resources o uso de vídeo pode crescer bastante;
+   o log do Series S mostrou Tiled Resources Tier 1. A implementação verifica
+   suporte e falha de criação, mas precisa ser testada no console. Medir CPU e
+   GPU separadamente, pois a expectativa é reduzir principalmente GPU.
+
+`clear_memory_page_state=true` é descrita pelo cvar como correção de alguns
+artefatos gráficos, não como controle de memória. Pode ser testada para o
+quadro verde do teste A, mas não como solução para o encerramento no limite.

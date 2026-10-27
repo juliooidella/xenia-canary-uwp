@@ -163,4 +163,5 @@ jobs:
             ci-logs/
             build/uwp/CMakeCache.txt
             build/uwp/CMakeFiles/CMakeConfigureLog.yaml
+            build/uwp/xeniacanary.map
           if-no-files-found: warn
