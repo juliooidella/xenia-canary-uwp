@@ -180,6 +180,10 @@ dword_result_t NtAllocateVirtualMemory_entry(lpdword_t base_addr_ptr,
   }
   if (!address) {
     // Failed - assume no memory available.
+    XELOGW(
+        "NtAllocateVirtualMemory: allocation failed: base {:08X}, size {:08X}, "
+        "type {:08X}",
+        adjusted_base, adjusted_size, uint32_t(alloc_type));
     return X_STATUS_NO_MEMORY;
   }
 

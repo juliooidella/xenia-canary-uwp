@@ -769,6 +769,8 @@ uint32_t Memory::SystemHeapAlloc(uint32_t size, uint32_t alignment,
   if (!heap->AllocSystemHeap(
           size, alignment, kMemoryAllocationReserve | kMemoryAllocationCommit,
           kMemoryProtectRead | kMemoryProtectWrite, false, &address)) {
+    XELOGW("SystemHeapAlloc: allocation failed: size {:08X}, {}", size,
+           is_physical ? "physical" : "virtual");
     return 0;
   }
   Zero(address, size);

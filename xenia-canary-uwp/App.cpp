@@ -2,6 +2,8 @@
 
 #include <windows.h>
 
+#include <algorithm>
+#include <chrono>
 #include <string>
 #include <utility>
 #include <vector>
@@ -196,13 +198,44 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
              static_cast<uint32_t>(error.code().value));
     }
 
+    // Log the app memory usage while it moves, to see how much of the
+    // foreground limit a title uses before an allocation fails.
+    constexpr uint64_t kMemoryLogStep = 64ull << 20;
+    auto next_memory_check = std::chrono::steady_clock::now();
+    uint64_t logged_memory_usage = 0;
+    uint64_t peak_memory_usage = 0;
+    bool memory_usage_available = true;
+
     while (!UWP::HasQuit()) {
       CoreWindow::GetForCurrentThread().Dispatcher().ProcessEvents(
           CoreProcessEventsOption::ProcessAllIfPresent);
 
       UWP::ExecutePendingFunctionsFromUIThread();
 
+      auto now = std::chrono::steady_clock::now();
+      if (memory_usage_available && now >= next_memory_check) {
+        next_memory_check = now + std::chrono::seconds(2);
+        try {
+          uint64_t usage =
+              winrt::Windows::System::MemoryManager::AppMemoryUsage();
+          peak_memory_usage = std::max(peak_memory_usage, usage);
+          uint64_t delta = usage > logged_memory_usage
+                               ? usage - logged_memory_usage
+                               : logged_memory_usage - usage;
+          if (delta >= kMemoryLogStep) {
+            logged_memory_usage = usage;
+            XELOGI("UWP app memory usage: {} MiB (peak {} MiB)", usage >> 20,
+                   peak_memory_usage >> 20);
+          }
+        } catch (const winrt::hresult_error&) {
+          memory_usage_available = false;
+        }
+      }
+
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (peak_memory_usage) {
+      XELOGI("UWP app memory usage peak: {} MiB", peak_memory_usage >> 20);
     }
 
     if (UWP::ShouldReturnToFrontend()) {
