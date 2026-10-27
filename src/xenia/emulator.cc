@@ -7,6 +7,8 @@
  ******************************************************************************
  */
 
+#include <algorithm>
+#include <chrono>
 #include <future>
 #include <mutex>
 #include <ranges>
@@ -1822,17 +1824,52 @@ bool Emulator::ExceptionCallback(Exception* ex) {
   assert_not_null(guest_function);
 
   auto context = current_thread->thread_state()->context();
+  const uint64_t crash_unix_ms = std::chrono::duration_cast<
+                                     std::chrono::milliseconds>(
+                                     std::chrono::system_clock::now()
+                                         .time_since_epoch())
+                                     .count();
+  const uint32_t guest_pc =
+      guest_function->MapMachineCodeToGuestAddress(ex->pc());
 
   std::string crash_msg;
-  crash_msg.append("==== CRASH DUMP ====\n");
+  crash_msg.append(fmt::format("==== CRASH DUMP unix_ms={} ====\n",
+                               crash_unix_ms));
   crash_msg.append(fmt::format("Thread ID (Host: 0x{:08X} / Guest: 0x{:08X})\n",
                                current_thread->thread()->system_id(),
                                current_thread->thread_id()));
   crash_msg.append(
       fmt::format("Thread Handle: 0x{:08X}\n", current_thread->handle()));
-  crash_msg.append(
-      fmt::format("PC: 0x{:08X}\n",
-                  guest_function->MapMachineCodeToGuestAddress(ex->pc())));
+  crash_msg.append(fmt::format("Host PC: 0x{:016X}\nGuest PC: 0x{:08X}\n",
+                               ex->pc(), guest_pc));
+  const uint32_t guest_sp = static_cast<uint32_t>(context->r[1]);
+  crash_msg.append(fmt::format(
+      "Guest LR: 0x{:08X}\nGuest SP: 0x{:08X}\nGuest stack bounds: "
+      "0x{:08X}-0x{:08X}\n",
+      static_cast<uint32_t>(context->lr), guest_sp,
+      current_thread->stack_limit(), current_thread->stack_base()));
+  if (guest_sp >= current_thread->stack_limit() &&
+      guest_sp < current_thread->stack_base()) {
+    const uint32_t stack_bytes =
+        std::min(uint32_t(128), current_thread->stack_base() - guest_sp);
+    crash_msg.append("Guest stack words from SP:\n");
+    for (uint32_t offset = 0; offset + sizeof(uint32_t) <= stack_bytes;
+         offset += sizeof(uint32_t)) {
+      uint32_t stack_address = guest_sp + offset;
+      auto stack_word_ptr =
+          kernel_state()->memory()->TranslateVirtualBE<uint32_t>(stack_address);
+      if (!stack_word_ptr) {
+        crash_msg.append(fmt::format(
+            "  stack read stopped at unmapped address {:08X}\n", stack_address));
+        break;
+      }
+      uint32_t stack_word = *stack_word_ptr;
+      crash_msg.append(fmt::format("  {:08X}: {:08X}\n", stack_address,
+                                   stack_word));
+    }
+  } else {
+    crash_msg.append("Guest SP is outside the current thread stack bounds\n");
+  }
   if (ex->code() == Exception::Code::kAccessViolation) {
     const char* op_str = "unknown";
     if (ex->access_violation_operation() ==

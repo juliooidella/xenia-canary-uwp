@@ -8,7 +8,10 @@
  */
 
 #include "xenia/kernel/xboxkrnl/xboxkrnl_memory.h"
+#include <chrono>
+
 #include "xenia/base/logging.h"
+#include "xenia/cpu/thread_state.h"
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/util/shim_utils.h"
 #include "xenia/kernel/xboxkrnl/xboxkrnl_private.h"
@@ -23,6 +26,34 @@ DEFINE_bool(
 namespace xe {
 namespace kernel {
 namespace xboxkrnl {
+
+namespace {
+
+constexpr uint32_t kAllocationTraceThreshold = 4 * 1024 * 1024;
+
+struct GuestAllocationCallsite {
+  uint32_t thread_id = 0;
+  uint32_t lr = 0;
+  uint32_t sp = 0;
+};
+
+uint64_t CurrentUnixTimeMilliseconds() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+GuestAllocationCallsite GetGuestAllocationCallsite() {
+  auto thread_state = cpu::ThreadState::Get();
+  if (!thread_state) {
+    return {};
+  }
+  auto context = thread_state->context();
+  return {thread_state->thread_id(), static_cast<uint32_t>(context->lr),
+          static_cast<uint32_t>(context->r[1])};
+}
+
+}  // namespace
 
 uint32_t ToXdkProtectFlags(uint32_t protect) {
   uint32_t result = 0;
@@ -94,6 +125,8 @@ dword_result_t NtAllocateVirtualMemory_entry(lpdword_t base_addr_ptr,
   if (!base_addr_ptr || !region_size_ptr || !*region_size_ptr) {
     return X_STATUS_INVALID_PARAMETER;
   }
+  const uint32_t requested_base = *base_addr_ptr;
+  const uint32_t requested_size = *region_size_ptr;
   // Check allocation type.
   if (!(alloc_type & (X_MEM_COMMIT | X_MEM_RESET | X_MEM_RESERVE))) {
     return X_STATUS_INVALID_PARAMETER;
@@ -180,11 +213,29 @@ dword_result_t NtAllocateVirtualMemory_entry(lpdword_t base_addr_ptr,
   }
   if (!address) {
     // Failed - assume no memory available.
+    auto callsite = GetGuestAllocationCallsite();
     XELOGW(
-        "NtAllocateVirtualMemory: allocation failed: base {:08X}, size {:08X}, "
-        "type {:08X}",
-        adjusted_base, adjusted_size, uint32_t(alloc_type));
+        "NtAllocateVirtualMemory: allocation failed: unix_ms {}, "
+        "requested_base {:08X}, "
+        "requested_size {:08X}, adjusted_base {:08X}, adjusted_size {:08X}, "
+        "type {:08X}, protect {:08X}, page_size {:08X}, guest_thread {}, "
+        "guest_lr {:08X}, guest_sp {:08X}",
+        CurrentUnixTimeMilliseconds(), requested_base, requested_size,
+        adjusted_base, adjusted_size, uint32_t(alloc_type),
+        uint32_t(protect_bits), page_size, callsite.thread_id, callsite.lr,
+        callsite.sp);
     return X_STATUS_NO_MEMORY;
+  }
+
+  if (adjusted_size >= kAllocationTraceThreshold) {
+    auto callsite = GetGuestAllocationCallsite();
+    XELOGI(
+        "Guest virtual allocation: unix_ms {}, base {:08X}, size {:X}, "
+        "type {:08X}, protect {:08X}, page_size {:X}, guest_thread {}, "
+        "guest_lr {:08X}, guest_sp {:08X}",
+        CurrentUnixTimeMilliseconds(), address, adjusted_size,
+        uint32_t(alloc_type), uint32_t(protect_bits), page_size,
+        callsite.thread_id, callsite.lr, callsite.sp);
   }
 
   // Zero memory, if needed.
@@ -300,6 +351,15 @@ dword_result_t NtFreeVirtualMemory_entry(lpdword_t base_addr_ptr,
   }
   if (!result) {
     return X_STATUS_UNSUCCESSFUL;
+  }
+
+  if (region_size_value >= kAllocationTraceThreshold) {
+    auto callsite = GetGuestAllocationCallsite();
+    XELOGI(
+        "Guest virtual free: unix_ms {}, base {:08X}, size {:X}, "
+        "type {:08X}, guest_thread {}, guest_lr {:08X}, guest_sp {:08X}",
+        CurrentUnixTimeMilliseconds(), base_addr_value, region_size_value,
+        uint32_t(free_type), callsite.thread_id, callsite.lr, callsite.sp);
   }
 
   *base_addr_ptr = base_addr_value;
@@ -479,10 +539,25 @@ uint32_t xeMmAllocatePhysicalMemoryEx(uint32_t flags, uint32_t region_size,
   if (!heap->AllocRange(heap_min_addr, heap_max_addr, adjusted_size,
                         adjusted_alignment, allocation_type, protect, top_down,
                         &base_address)) {
-    // Failed - assume no memory available.
-    XELOGW("MmAllocatePhysicalMemoryEx: Allocation failed: {:08X} Size: {:08X}",
-           base_address, adjusted_size);
+    auto callsite = GetGuestAllocationCallsite();
+    XELOGW(
+        "MmAllocatePhysicalMemoryEx failed: unix_ms {}, size {:X}, flags "
+        "{:08X}, protect {:08X}, min {:08X}, max {:08X}, alignment {:X}, "
+        "page_size {:X}, guest_thread {}, guest_lr {:08X}, guest_sp {:08X}",
+        CurrentUnixTimeMilliseconds(), adjusted_size, flags, protect_bits,
+        min_addr_range, max_addr_range, adjusted_alignment, page_size,
+        callsite.thread_id, callsite.lr, callsite.sp);
     return 0;
+  }
+  if (adjusted_size >= kAllocationTraceThreshold) {
+    auto callsite = GetGuestAllocationCallsite();
+    XELOGI(
+        "Guest physical allocation: unix_ms {}, base {:08X}, size {:X}, "
+        "flags {:08X}, protect {:08X}, alignment {:X}, page_size {:X}, "
+        "guest_thread {}, guest_lr {:08X}, guest_sp {:08X}",
+        CurrentUnixTimeMilliseconds(), base_address, adjusted_size, flags,
+        protect_bits, adjusted_alignment, page_size, callsite.thread_id,
+        callsite.lr, callsite.sp);
   }
   XELOGD("MmAllocatePhysicalMemoryEx = {:08X} Size: {:08X}", base_address,
          adjusted_size);
@@ -513,6 +588,17 @@ void MmFreePhysicalMemory_entry(dword_t type, dword_t base_address) {
   assert_true((base_address & 0x1F) == 0);
 
   auto heap = kernel_state()->memory()->LookupHeap(base_address);
+  HeapAllocationInfo allocation_info = {};
+  if (heap->QueryRegionInfo(base_address, &allocation_info) &&
+      allocation_info.allocation_size >= kAllocationTraceThreshold) {
+    auto callsite = GetGuestAllocationCallsite();
+    XELOGI(
+        "Guest physical free: unix_ms {}, base {:08X}, size {:X}, type "
+        "{:08X}, guest_thread {}, guest_lr {:08X}, guest_sp {:08X}",
+        CurrentUnixTimeMilliseconds(), allocation_info.allocation_base,
+        allocation_info.allocation_size, uint32_t(type), callsite.thread_id,
+        callsite.lr, callsite.sp);
+  }
   heap->Release(base_address);
 }
 DECLARE_XBOXKRNL_EXPORT1(MmFreePhysicalMemory, kMemory, kImplemented);
@@ -681,20 +767,34 @@ struct X_POOL_ALLOC_HEADER {
 
 uint32_t xeAllocatePoolTypeWithTag(PPCContext* context, uint32_t size,
                                    uint32_t tag, uint32_t pool_selector) {
+  uint32_t address = 0;
   if (size <= 0xFD8) {
     uint32_t adjusted_size = size + sizeof(X_POOL_ALLOC_HEADER);
 
-    uint32_t addr =
-        kernel_state()->memory()->SystemHeapAlloc(adjusted_size, 64);
+    address = kernel_state()->memory()->SystemHeapAlloc(adjusted_size, 64);
+    if (!address) {
+      return 0;
+    }
 
-    auto result_ptr = context->TranslateVirtual<X_POOL_ALLOC_HEADER*>(addr);
+    auto result_ptr =
+        context->TranslateVirtual<X_POOL_ALLOC_HEADER*>(address);
     result_ptr->unk_2 = 170;
     result_ptr->tag = tag;
 
-    return addr + sizeof(X_POOL_ALLOC_HEADER);
+    address += sizeof(X_POOL_ALLOC_HEADER);
   } else {
-    return kernel_state()->memory()->SystemHeapAlloc(size, 4096);
+    address = kernel_state()->memory()->SystemHeapAlloc(size, 4096);
   }
+  if (address && size >= kAllocationTraceThreshold) {
+    auto callsite = GetGuestAllocationCallsite();
+    XELOGI(
+        "Guest pool allocation: unix_ms {}, address {:08X}, size {:X}, "
+        "tag {:08X}, selector {:08X}, guest_thread {}, guest_lr {:08X}, "
+        "guest_sp {:08X}",
+        CurrentUnixTimeMilliseconds(), address, size, tag, pool_selector,
+        callsite.thread_id, callsite.lr, callsite.sp);
+  }
+  return address;
 }
 
 dword_result_t ExAllocatePoolTypeWithTag_entry(dword_t size, dword_t tag,
@@ -719,6 +819,21 @@ DECLARE_XBOXKRNL_EXPORT1(ExAllocatePool, kMemory, kImplemented);
 
 void xeFreePool(PPCContext* context, uint32_t base_address) {
   auto memory = context->kernel_state->memory();
+  uint32_t allocation_base = (base_address & (4096 - 1))
+                                 ? base_address - sizeof(X_POOL_ALLOC_HEADER)
+                                 : base_address;
+  auto heap = memory->LookupHeap(allocation_base);
+  HeapAllocationInfo allocation_info = {};
+  if (heap && heap->QueryRegionInfo(allocation_base, &allocation_info) &&
+      allocation_info.allocation_size >= kAllocationTraceThreshold) {
+    auto callsite = GetGuestAllocationCallsite();
+    XELOGI(
+        "Guest pool free: unix_ms {}, address {:08X}, size {:X}, "
+        "guest_thread {}, guest_lr {:08X}, guest_sp {:08X}",
+        CurrentUnixTimeMilliseconds(), allocation_base,
+        allocation_info.allocation_size, callsite.thread_id, callsite.lr,
+        callsite.sp);
+  }
   // if 4kb aligned, there is no pool header!
   if ((base_address & (4096 - 1)) == 0) {
     memory->SystemHeapFree(base_address);

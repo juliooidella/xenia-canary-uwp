@@ -9,6 +9,7 @@
 
 #include "xenia/memory.h"
 
+#include <chrono>
 #include <cstring>
 #include <random>
 
@@ -204,9 +205,15 @@ void Memory::LogHostCommit(std::string_view step) {
   MEMORYSTATUSEX status = {};
   status.dwLength = sizeof(status);
   if (GlobalMemoryStatusEx(&status)) {
-    XELOGI("Host commit {}: {} MiB of {} MiB", step,
+    uint64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    XELOGI("Host memory {}: unix_ms {}, commit {} MiB of {} MiB, physical "
+           "available {} MiB of {} MiB",
+           step, unix_ms,
            (status.ullTotalPageFile - status.ullAvailPageFile) >> 20,
-           status.ullTotalPageFile >> 20);
+           status.ullTotalPageFile >> 20, status.ullAvailPhys >> 20,
+           status.ullTotalPhys >> 20);
   }
 #endif
 }
@@ -1359,8 +1366,30 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
   }
 
   if (start_page_number == UINT_MAX || end_page_number == UINT_MAX) {
-    // Out of memory.
-    XELOGE("BaseHeap::Alloc failed to find contiguous range");
+    uint64_t free_page_count = 0;
+    uint32_t largest_free_block_pages = 0;
+    for (const auto& free_block : free_blocks_) {
+      free_page_count += free_block.second;
+      largest_free_block_pages =
+          std::max(largest_free_block_pages, free_block.second);
+    }
+    XELOGE(
+        "BaseHeap::Alloc failed to find contiguous range: heap_type {}, "
+        "unix_ms {}, heap_range {:08X}-{:08X}, request_size {:X}, "
+        "page_size {:X}, "
+        "page_count {}, alignment {:X}, search_range {:08X}-{:08X}, "
+        "top_down {}, free_pages {} ({:X} bytes), "
+        "largest_free_block_pages {} ({:X} bytes)",
+        uint32_t(heap_type_),
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count(),
+        uint64_t(heap_base_),
+        uint64_t(heap_base_) + heap_size_, size, page_size_, page_count,
+        alignment, low_address, high_address, top_down,
+        free_page_count, free_page_count * page_size_,
+        largest_free_block_pages,
+        uint64_t(largest_free_block_pages) * page_size_);
     // assert_always("Heap exhausted!");
     return false;
   }
@@ -1380,11 +1409,38 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
           TranslateRelative(start_page_number << page_size_shift_),
           page_count << page_size_shift_, alloc_type, ToPageAccess(protect));
       if (!result) {
-        XELOGE("BaseHeap::Alloc failed to alloc range from host{}",
-               HostErrorSuffix());
-        Memory::LogHostCommit("at failed allocation");
         // Restore the free block since we failed.
         InsertFreeBlock(start_page_number, page_count);
+        uint64_t free_page_count = 0;
+        uint32_t largest_free_block_pages = 0;
+        for (const auto& free_block : free_blocks_) {
+          free_page_count += free_block.second;
+          largest_free_block_pages =
+              std::max(largest_free_block_pages, free_block.second);
+        }
+        uintptr_t host_address = reinterpret_cast<uintptr_t>(TranslateRelative(
+            start_page_number << page_size_shift_));
+        uint32_t guest_address =
+            heap_base_ + (start_page_number << page_size_shift_);
+        uint64_t allocation_size = uint64_t(page_count) * page_size_;
+        uint64_t guest_range_end = uint64_t(guest_address) + allocation_size;
+        XELOGE(
+            "BaseHeap::Alloc host commit failed{}: unix_ms {}, heap_type {}, "
+            "guest_range {:08X}-{:08X}, host_address {:016X}, size {:X}, "
+            "page_size {:X}, page_count {}, alignment {:X}, allocation_type "
+            "{:X}, protect {:X}, top_down {}, free_pages {} ({:X} bytes), "
+            "largest_free_block_pages {} ({:X} bytes)",
+            HostErrorSuffix(),
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch())
+                .count(),
+            uint32_t(heap_type_), guest_address,
+            guest_range_end, host_address, allocation_size, page_size_,
+            page_count, alignment, allocation_type, protect, top_down,
+            free_page_count,
+            free_page_count * page_size_, largest_free_block_pages,
+            uint64_t(largest_free_block_pages) * page_size_);
+        Memory::LogHostCommit("at failed allocation");
         return false;
       }
 

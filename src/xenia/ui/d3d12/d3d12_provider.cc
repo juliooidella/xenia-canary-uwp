@@ -9,6 +9,8 @@
 
 #include "xenia/ui/d3d12/d3d12_provider.h"
 
+#include <chrono>
+
 #include <cstdlib>
 
 #include "xenia/base/cvar.h"
@@ -511,11 +513,21 @@ uint32_t D3D12Provider::CreateUploadResource(
     void** ppvResource, const D3D12_CLEAR_VALUE* pOptimizedClearValue) const {
   auto device = GetDevice();
 
-  if (FAILED(device->CreateCommittedResource(
-          &ui::d3d12::util::kHeapPropertiesUpload, HeapFlags, pDesc,
-          InitialResourceState, pOptimizedClearValue, riidResource,
-          ppvResource))) {
-    XELOGE("Failed to create the gamma ramp upload buffer");
+  HRESULT create_result = device->CreateCommittedResource(
+      &ui::d3d12::util::kHeapPropertiesUpload, HeapFlags, pDesc,
+      InitialResourceState, pOptimizedClearValue, riidResource, ppvResource);
+  if (FAILED(create_result)) {
+    uint64_t unix_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                           std::chrono::system_clock::now().time_since_epoch())
+                           .count();
+    XELOGE(
+        "Failed to create D3D12 upload resource: unix_ms {}, HRESULT "
+        "0x{:08X}, "
+        "device_removed_reason 0x{:08X}, width {}, height {}, format {}, "
+        "heap_flags 0x{:08X}",
+        unix_ms, static_cast<uint32_t>(create_result),
+        static_cast<uint32_t>(device->GetDeviceRemovedReason()), pDesc->Width,
+        pDesc->Height, uint32_t(pDesc->Format), uint32_t(HeapFlags));
     return UPLOAD_RESULT_CREATE_FAILED;
   }
 

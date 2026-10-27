@@ -49,6 +49,7 @@ constexpr USHORT kTrackedStackDepth = 8;
 
 struct TrackedAllocation {
   std::atomic<uint64_t> sequence{0};
+  uint64_t unix_ms = 0;
   size_t size = 0;
   uintptr_t address = 0;
   DWORD thread_id = 0;
@@ -59,6 +60,8 @@ struct TrackedAllocation {
 std::array<TrackedAllocation, kTrackedAllocationCount> tracked_allocations;
 std::atomic<uint64_t> tracked_allocation_count{0};
 
+uint64_t CurrentUnixTimeMilliseconds();
+
 void RecordTrackedAllocation(size_t size, void* address) {
   if (size < kTrackedAllocationThreshold) {
     return;
@@ -68,6 +71,7 @@ void RecordTrackedAllocation(size_t size, void* address) {
   TrackedAllocation& event =
       tracked_allocations[(sequence - 1) % kTrackedAllocationCount];
   event.sequence.store(0, std::memory_order_release);
+  event.unix_ms = CurrentUnixTimeMilliseconds();
   event.size = size;
   event.address = reinterpret_cast<uintptr_t>(address);
   event.thread_id = GetCurrentThreadId();
@@ -115,14 +119,22 @@ void LogTrackedAllocations(uint64_t& last_logged_sequence) {
         stack += fmt::format("{:016X}", frame);
       }
     }
-    XELOGI("Large C++ allocation #{}: {} KiB at {:016X}, thread {}, stack [{}]",
-           sequence, event.size >> 10, event.address, event.thread_id, stack);
+    XELOGI(
+        "Large C++ allocation #{}: unix_ms {}, {} KiB at {:016X}, thread {}, "
+        "stack [{}]",
+        sequence, event.unix_ms, event.size >> 10, event.address,
+        event.thread_id, stack);
   }
   last_logged_sequence = last_sequence;
 }
 
-// GPU memory charged to this process on the first adapter; 0 if unknown.
-uint64_t QueryGpuMemoryUsage() {
+struct GpuMemoryUsage {
+  uint64_t current = 0;
+  uint64_t budget = 0;
+  uint64_t available_for_reservation = 0;
+};
+
+GpuMemoryUsage QueryGpuMemoryUsage() {
   static IDXGIAdapter3* adapter = nullptr;
   static bool initialized = false;
   if (!initialized) {
@@ -138,14 +150,20 @@ uint64_t QueryGpuMemoryUsage() {
     }
   }
   if (!adapter) {
-    return 0;
+    return {};
   }
   DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
   if (FAILED(adapter->QueryVideoMemoryInfo(
           0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
-    return 0;
+    return {};
   }
-  return info.CurrentUsage;
+  return {info.CurrentUsage, info.Budget, info.AvailableForReservation};
+}
+
+uint64_t CurrentUnixTimeMilliseconds() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
 }
 
 // Copies memory that another thread may release meanwhile.
@@ -466,7 +484,8 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
 
     try {
       XELOGI(
-          "UWP app memory usage: {} MiB; limit: {} MiB",
+          "UWP app memory usage: unix_ms {}, {} MiB; limit: {} MiB",
+          CurrentUnixTimeMilliseconds(),
           winrt::Windows::System::MemoryManager::AppMemoryUsage() >> 20,
           winrt::Windows::System::MemoryManager::AppMemoryUsageLimit() >> 20);
     } catch (const winrt::hresult_error& error) {
@@ -511,11 +530,18 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
             uint64_t private_commit = winrt::Windows::System::MemoryManager::
                                           GetAppMemoryReport()
                                               .PrivateCommitUsage();
+            uint64_t app_memory_limit = winrt::Windows::System::MemoryManager::
+                                            AppMemoryUsageLimit();
+            GpuMemoryUsage gpu_memory = QueryGpuMemoryUsage();
             XELOGI(
-                "UWP app memory usage: {} MiB (peak {} MiB; private commit {} "
-                "MiB; GPU {} MiB)",
-                usage >> 20, peak_memory_usage >> 20, private_commit >> 20,
-                QueryGpuMemoryUsage() >> 20);
+                "UWP app memory usage: unix_ms {}, {} MiB of {} MiB (peak {} "
+                "MiB; private commit {} MiB; GPU {} MiB, budget {} MiB, "
+                "available for reservation {} MiB)",
+                CurrentUnixTimeMilliseconds(), usage >> 20,
+                app_memory_limit >> 20, peak_memory_usage >> 20,
+                private_commit >> 20, gpu_memory.current >> 20,
+                gpu_memory.budget >> 20,
+                gpu_memory.available_for_reservation >> 20);
           }
         } catch (const winrt::hresult_error&) {
           memory_usage_available = false;

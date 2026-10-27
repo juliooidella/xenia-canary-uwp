@@ -8,6 +8,7 @@
  */
 
 #include "xenia/gpu/d3d12/d3d12_command_processor.h"
+#include <chrono>
 #include <cstring>
 #include "xenia/apu/audio_system.h"
 #include "xenia/base/assert.h"
@@ -45,6 +46,16 @@ DECLARE_bool(readback_resolve_half_pixel_offset);
 namespace xe {
 namespace gpu {
 namespace d3d12 {
+
+namespace {
+
+uint64_t CurrentUnixTimeMilliseconds() {
+  return std::chrono::duration_cast<std::chrono::milliseconds>(
+             std::chrono::system_clock::now().time_since_epoch())
+      .count();
+}
+
+}  // namespace
 
 // Generated with `xb buildshaders`.
 namespace shaders {
@@ -626,11 +637,17 @@ ID3D12Resource* D3D12CommandProcessor::RequestScratchGPUBuffer(
   ui::d3d12::util::FillBufferResourceDesc(
       buffer_desc, size, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
   ID3D12Resource* buffer;
-  if (FAILED(device->CreateCommittedResource(
-          &ui::d3d12::util::kHeapPropertiesDefault,
-          provider.GetHeapFlagCreateNotZeroed(), &buffer_desc, state, nullptr,
-          IID_PPV_ARGS(&buffer)))) {
-    XELOGE("Failed to create a {} MB scratch GPU buffer", size >> 20);
+  HRESULT create_result = device->CreateCommittedResource(
+      &ui::d3d12::util::kHeapPropertiesDefault,
+      provider.GetHeapFlagCreateNotZeroed(), &buffer_desc, state, nullptr,
+      IID_PPV_ARGS(&buffer));
+  if (FAILED(create_result)) {
+    XELOGE(
+        "Failed to create a {} MB scratch GPU buffer: unix_ms {}, HRESULT "
+        "0x{:08X}, device_removed_reason 0x{:08X}",
+        size >> 20, CurrentUnixTimeMilliseconds(),
+        static_cast<uint32_t>(create_result),
+        static_cast<uint32_t>(device->GetDeviceRemovedReason()));
     return nullptr;
   }
   if (scratch_buffer_ != nullptr) {
@@ -3581,6 +3598,10 @@ bool D3D12CommandProcessor::BeginSubmission(bool is_guest_command) {
   ID3D12Device* device = GetD3D12Provider().GetDevice();
   HRESULT device_removed_reason = device->GetDeviceRemovedReason();
   if (FAILED(device_removed_reason)) {
+    XELOGE("D3D12 device unavailable: unix_ms {}, GetDeviceRemovedReason "
+           "0x{:08X}",
+           CurrentUnixTimeMilliseconds(),
+           static_cast<uint32_t>(device_removed_reason));
     device_removed_ = true;
     graphics_system_->OnHostGpuLossFromAnyThread(device_removed_reason !=
                                                  DXGI_ERROR_DEVICE_REMOVED);
