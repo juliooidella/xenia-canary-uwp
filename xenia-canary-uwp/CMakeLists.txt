@@ -39,7 +39,7 @@ target_link_libraries(xenia-uwp PRIVATE
   xenia-debug-ui xenia-app-discord
   aes_128 capstone fmt dxbc glslang-spirv imgui libavcodec libavutil mspack snappy xxhash
   libcurl miniupnp
-  windowsapp runtimeobject
+  windowsapp runtimeobject dxgi
 )
 
 set_target_properties(xenia-uwp PROPERTIES

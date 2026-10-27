@@ -2,6 +2,8 @@
 
 #include <windows.h>
 
+#include <dxgi1_4.h>
+
 #include <algorithm>
 #include <chrono>
 #include <string>
@@ -31,6 +33,37 @@
 #include "protocol_activation.h"
 #include "xenia/base/logging.h"
 #include "xenia/config.h"
+
+namespace {
+
+// GPU memory charged to this process on the first adapter; 0 if unknown.
+uint64_t QueryGpuMemoryUsage() {
+  static IDXGIAdapter3* adapter = nullptr;
+  static bool initialized = false;
+  if (!initialized) {
+    initialized = true;
+    IDXGIFactory2* factory = nullptr;
+    if (SUCCEEDED(CreateDXGIFactory2(0, IID_PPV_ARGS(&factory)))) {
+      IDXGIAdapter1* adapter1 = nullptr;
+      if (SUCCEEDED(factory->EnumAdapters1(0, &adapter1))) {
+        adapter1->QueryInterface(IID_PPV_ARGS(&adapter));
+        adapter1->Release();
+      }
+      factory->Release();
+    }
+  }
+  if (!adapter) {
+    return 0;
+  }
+  DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+  if (FAILED(adapter->QueryVideoMemoryInfo(
+          0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &info))) {
+    return 0;
+  }
+  return info.CurrentUsage;
+}
+
+}  // namespace
 #include "xenia/ui/imgui_dialog.h"
 
 using namespace winrt;
@@ -224,8 +257,14 @@ struct App : implements<App, IFrameworkViewSource, IFrameworkView> {
                                : logged_memory_usage - usage;
           if (delta >= kMemoryLogStep) {
             logged_memory_usage = usage;
-            XELOGI("UWP app memory usage: {} MiB (peak {} MiB)", usage >> 20,
-                   peak_memory_usage >> 20);
+            uint64_t private_commit = winrt::Windows::System::MemoryManager::
+                                          GetAppMemoryReport()
+                                              .PrivateCommitUsage();
+            XELOGI(
+                "UWP app memory usage: {} MiB (peak {} MiB; private commit {} "
+                "MiB; GPU {} MiB)",
+                usage >> 20, peak_memory_usage >> 20, private_commit >> 20,
+                QueryGpuMemoryUsage() >> 20);
           }
         } catch (const winrt::hresult_error&) {
           memory_usage_available = false;
